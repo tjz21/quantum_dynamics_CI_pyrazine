@@ -1,0 +1,34 @@
+Remark line goes here
+MASS
+nb 14.010        0.530
+ca 12.010        0.360
+h4 1.008         0.135
+
+BOND
+ca-nb  488.00   1.339
+ca-ca  461.10   1.398
+ca-h4  341.50   1.089
+
+ANGLE
+ca-ca-nb   68.800     122.940
+h4-ca-nb   51.900     116.030
+ca-nb-ca   68.300     117.220
+ca-ca-h4   48.100     120.340
+
+DIHE
+nb-ca-ca-nb   4   14.500       180.000           2.000
+h4-ca-ca-nb   4   14.500       180.000           2.000
+ca-ca-nb-ca   2    9.600       180.000           2.000
+h4-ca-nb-ca   2    9.600       180.000           2.000
+h4-ca-ca-h4   4   14.500       180.000           2.000
+
+IMPROPER
+ca-h4-ca-nb         1.1          180.0         2.0          Same as X -X -ca-ha, penalty score= 44.3 (use general term))
+
+NONBON
+  nb          1.8240  0.1700
+  ca          1.9080  0.0860
+  h4          1.4090  0.0150
+
+
+
