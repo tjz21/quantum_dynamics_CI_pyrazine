@@ -1,0 +1,1 @@
+MD data, chain coefficients, input scripts and absorption spectra for pyrazine in cyclohexane and water.

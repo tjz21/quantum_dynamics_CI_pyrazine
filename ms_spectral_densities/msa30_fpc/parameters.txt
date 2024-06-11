@@ -1,0 +1,26 @@
+wi: 0
+wf = max(wo_vib_1,wo_vib_2,wo_vib_g) + 30 * max(fwhm_vib_1,fwhm_vib_2,fwhm_vib_g) = : 0.007289293849658315
+Nw: 100000
+cross_coeff: 0.999999999999999
+S0-S1 adiabatic gap (eV): 3.0
+w_Debye_1 (cm-1): 30.0
+w_Debye_2 (cm-1): 30.0
+w_Debye_g (cm-1): 30.0
+lam_Debye_1 (cm-1): 100.0
+lam_Debye_2 (cm-1): 50.0
+lam_Debye_g (cm-1): 100.0
+wo_vib_1 (cm-1): 1000.0
+wo_vib_2 (cm-1): 1000.0
+wo_vib_g (cm-1): 500.0
+lam_vib_1 (cm-1): 100.0
+lam_vib_2 (cm-1): 949.9999999999999
+lam_vib_g (cm-1): 899.9999999999999
+fwhm_vib_1 (cm-1): 20.0
+fwhm_vib_2 (cm-1): 20.0
+fwhm_vib_g (cm-1): 20.0
+sigma_vib_1 (cm-1): 8.493218002880191
+sigma_vib_2 (cm-1): 8.493218002880191
+sigma_g (cm-1): 8.493218002880191
+peak_vib_1: 0.06722360671938157
+peak_vib_2: 0.6386242638341249
+peak_g: 0.30244071458596733

@@ -1,0 +1,204 @@
+#! /path/to/julia-1.8.1/bin/julia -O3
+
+# MPSDynamics wrapper for linear emission spectroscopy, modified to run on GPUs
+
+######### INPUT PARAMETERS ##############
+run_name = "Pyrazine in water"
+
+energy_1 = 0.16477045205309415
+energy_2 = 0.187575841740946278795 # S2 - should be at 0.205724679029625 but shift down to just 0.84 eV above S1 (see below)
+coupling = -3.646902841510081e-05
+dipole_moment_1 = 0.28199700445399467
+dipole_moment_2 = 1.0054374396407775
+
+savedir = pwd() * "/"
+coeffsdir = savedir * "chain_coeffs_pyrazine_water.hdf5"
+
+time_step             = 10
+total_time_absorption = 10000  # tmax=10000
+total_time_emission   = 4200
+temp                  = 300
+chain_length          = 150    #N = 150
+num_fock              = 30     #d = 30
+bond_dims             = [50]    # D=50
+###############################################
+###############################################
+#Diabatic state 1:
+#Average energy (Ha):          0.16477045205309415
+#Average oscillator strength:  0.008735284701904017
+#Average dipole moment (a.u.): 0.28199700445399467
+#
+#Diabatic state 2: 
+#Average energy (Ha):          0.20482082335149676 --> corrected to 0.187575841740946278795
+#Average oscillator strength:  0.1380361871740131
+#Average dipole moment (a.u.): 1.0054374396407775
+#
+#Average couplings (Ha):
+#S1-S2: -3.646902841510081e-05
+#
+#Reorganization energies (Ha):
+#State 1: 0.007691827237237275
+#State 2: 0.009173235535957232
+#S1-S2 coupling: 0.007851573989361975
+#correct S1 S2 gap by vacuum amount: 0.20482082335149676-0.017244981610550481205=0.187575841740946278795
+###############################################
+###############################################
+# Pyrazine in vacuum data:
+#abatic state 1:
+#Average energy (Ha):          0.15585227646038904
+#Average oscillator strength:  0.008492554492040784
+#Average dipole moment (a.u.): 0.2858960963611224
+#
+#Diabatic state 2:
+#Average energy (Ha):          0.205724679029625 --> corrected to 0.188479697419074518795 
+#Average oscillator strength:  0.11587996359305569
+#Average dipole moment (a.u.): 0.9191927872622874
+#
+#Average couplings (Ha):
+#S1-S2: -2.3219367668111325e-05
+#
+#Reorganization energies (Ha):
+#State 1: 0.0050723127074420865
+#State 2: 0.006830300458077648
+#S1-S2 coupling: 0.007573519463445645i#
+# S1-S2 gap at their respective minima: (0.205724679029625-0.006830300458077648)-(0.15585227646038904-0.0050723127074420865)
+# = 0.0481144148186003985 Ha = 1.309259816 eV. To create a gap that is 0.84 eV we need to shift S2 down by 0.4692598161823361114 eV= 0.017244981610550481205 Ha
+# S2 new: 0.205724679029625-0.017244981610550481205=0.188479697419074518795 Ha. 
+# ###################################################
+# ###################################################
+# Pyrazine in cyclohex data: 
+# Diabatic state 1:
+# Average energy (Ha):          0.15606532244147994
+# Average oscillator strength:  0.008515015980740101
+# Average dipole moment (a.u.): 0.28607845800232024
+#
+# Diabatic state 2:
+# Average energy (Ha):          0.20648658778156953 --> corrected to: 0.18924160617101904879
+# Average oscillator strength:  0.11658187853490823
+# Average dipole moment (a.u.): 0.9202699271520256
+#
+# Average couplings (Ha):
+# S1-S2: -9.077620452628038e-05
+#
+# Reorganization energies (Ha):
+# State 1: 0.00541668840185646
+# State 2: 0.00687043999633372
+# S1-S2 coupling: 0.007581677194746602
+# Shift S1 down by 0.017244981610550481205 (Same amount as in Vacuum) 
+# S2 new: 0.20648658778156953-0.017244981610550481205=0.18924160617101904879
+
+push!(ARGS, "GPU")
+using CUDA
+include("/path/to/MPSDynamics.jl")
+M = MPSDynamics
+
+# Read the chain coefficients
+s1_chain_coeffs = M.readchaincoeffs(
+    coeffsdir, "temp_" * string(temp), "s1"
+)
+long_range_s1_to_s2 = M.h5read(
+    coeffsdir, "temp_" * string(temp) * "/long_range_s1_to_s2"
+)
+s2_chain_coeffs = M.readchaincoeffs(
+    coeffsdir, "temp_" * string(temp), "s2"
+)
+long_range_s2_to_s1 = M.h5read(
+    coeffsdir, "temp_" * string(temp) * "/long_range_s2_to_s1"
+)
+s1_s2_coupling = M.readchaincoeffs(
+    coeffsdir, "temp_" * string(temp), "s1_s2_coupling"
+)
+
+# Construct the system Hamiltonian (a matrix product operator)
+mpo = M.methylbluempo2(
+    energy_1,     energy_2,     coupling, 
+    chain_length, chain_length, chain_length, 
+    num_fock,     num_fock,     num_fock, 
+    s1_chain_coeffs, long_range_s1_to_s2, long_range_s2_to_s1, s2_chain_coeffs, 
+    s1_s2_coupling
+)
+
+# Define operators for the system
+s2 = M.unitcol(1, 3)
+s1 = M.unitcol(2, 3)
+s0 = M.unitcol(3, 3)
+# Normalization constant
+a = sqrt(1 / (1 + dipole_moment_1 ^ 2 + dipole_moment_2 ^ 2))
+# Define initial populations
+psi = a * (s0 + dipole_moment_1 * s1 + dipole_moment_2 * s2)
+# The dipole moment creation operator
+mu = (1 / a ^ 2) * (dipole_moment_1 * s0 * s1' + dipole_moment_2 * s0 * s2')
+
+# Calculate the initial wavefunction
+mps = M.productstatemps(
+    mpo.tree, 
+    M.physdims(mpo), 
+    state = [psi, fill(M.unitcol(1, num_fock), 3 * chain_length)...]
+)
+
+# Occupancies at certain sites in the network
+# Every node on the S1 chain
+ob4 = M.OneSiteObservable("occ1", M.numb(num_fock), (2, chain_length + 1))
+# Every node on the S2 chain
+ob5 = M.OneSiteObservable(
+    "occ2", M.numb(num_fock), (chain_length + 2, 2 * chain_length + 1)
+)
+# Every node on the S1-S2 coupling chain
+ob6 = M.OneSiteObservable(
+    "occ12", M.numb(num_fock), (2 * chain_length + 2, 3 * chain_length +1)
+)
+# The dipole creation operator, and thereby the dipole correlation function
+ob7 = M.OneSiteObservable("dcf", mu, 1)
+# Populations
+ob8 = M.OneSiteObservable("s0", s0 * s0', 1)
+ob9 = M.OneSiteObservable("s1", s1 * s1', 1)
+ob10 = M.OneSiteObservable("s2", s2 * s2', 1)
+# Coherences
+ob11 = M.OneSiteObservable("s1s2", s1 * s2', 1)
+ob12 = M.OneSiteObservable("s0s2", s0 * s2', 1)
+ob13 = M.OneSiteObservable("s0s1", s0 * s1', 1)
+
+# Propogate the excited state (to calculate the absorption spectrum)
+mps_relaxed, dat = M.runsim(
+    time_step, total_time_absorption, mps, mpo;
+    name = run_name * ": Absorption",
+    method = :TDVP1,
+    savedir = savedir,
+    obs = [],
+    convobs = [ob4, ob5, ob6, ob7, ob8, ob9, ob10],
+    convparams = bond_dims,
+    verbose = false,
+    save = true,
+    plot = true,
+    params = M.@LogParams(
+        psi, 
+        energy_1, energy_2, coupling, dipole_moment_1, dipole_moment_2, 
+        temp, chain_length, num_fock
+    )
+)
+
+# Project population back to S0:
+#mps_relaxed[1][:, :, :, :, 3] = (
+#    dipole_moment_1 *  mps_relaxed[1][:, :, :, :, 2] 
+#    + dipole_moment_2 *  mps_relaxed[1][:, :, :, :, 1]
+#)
+# Propagate again (to calculate the emission spectrum)
+#mps_relaxed_2, dat = M.runsim(
+#    time_step, total_time_emission, mps_relaxed, mpo;
+#    name = run_name * ": Emission",
+#    method = :TDVP1,
+#    savedir = savedir,
+#    obs = [],
+#    convobs = [ob4, ob5, ob6, ob7, ob8, ob9, ob10],
+#    convparams = bond_dims,
+#    verbose = false,
+#    save = true,
+#    plot = true,
+#    params = M.@LogParams(
+#        psi, 
+#        energy_1, energy_2, coupling, dipole_moment_1, dipole_moment_2, 
+#        temp, chain_length, num_fock
+#    )
+#)
+
+
