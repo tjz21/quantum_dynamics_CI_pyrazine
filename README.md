@@ -26,7 +26,7 @@ Dynamics were run using the MPSDynamics package (github.com/shareloqs/MPSDynamic
 │       ├── MM_equilibration
 │       ├── QM:MM
 │       └── TDDFT
-├── Python_scripts # Python scripts used to generate the chain coefficients, thermalize spectral densities, and compute linear response lineshapes
+├── Python_scripts # Python scripts used to generate the thermalize spectral densities/generate chain coefficients and compute linear response lineshapes
 ├── Quantum_dynamics # Chain coefficients and MPSDynamics_scripts used to compute pyrazine vacuum/water/cyclohexane trajectories
 │   ├── Chain_coefficients
 │   └── MPSdynamics_scripts
