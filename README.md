@@ -50,4 +50,5 @@ Additionally, the repository contains a number of python scripts to process some
         │   └── Fock_states
         ├── Pyrazine_vac_correlations
         └── Pyrazine_vac_coupling_scaling
+
 '''
