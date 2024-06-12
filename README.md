@@ -16,7 +16,7 @@ Tensor network dynamics were run using the MPSDynamics package (github.com/share
 │   ├── MSA30
 │   ├── MSB200
 │   └── MSB30
-├── Molecular_dynamics
+├── Molecular_dynamics # Input files used to perform MM equilibration, QM/MM MD, and TDDFT calculations  
 │   ├── Cyclohexane
 │   │   ├── Cyc_box
 │   │   ├── MM_equilibration
