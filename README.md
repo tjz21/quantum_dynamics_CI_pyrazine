@@ -10,7 +10,7 @@ Additionally, the repository contains a number of python scripts to process some
 
 Tensor network dynamics were run using the MPSDynamics package (github.com/shareloqs/MPSDynamics.git) with Julia version 1.8.1.
 
-```bash
+```
 ├── Model_systems # Spectral densities, chain coefficients (hdf5), and MPSdynamics scripts for each model system
 │   ├── MSA200
 │   ├── MSA30
