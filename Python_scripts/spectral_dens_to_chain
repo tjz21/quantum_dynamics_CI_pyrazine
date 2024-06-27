@@ -1,0 +1,628 @@
+#! /usr/bin/env python
+
+#      spectral_dens_to_chain
+#
+# Map continuous spectral densities to discrete chains using orthogonal
+# polynomials.
+#
+# 4 required command-line arguments:
+#   $1: S1 spectral density file name (all spectral densities should be in two
+#     column text files with frequncies in units of Hartree.)
+#   $2: S2 spectral density
+#   $3: S1 cross S2 spectral density
+#   $4: S1-S2 coupling spectral density
+# 5 optional arguments provided (in any order) as `option=value`
+#   num_coeffs=int (default: 500): the number of nodes in each chain to
+#     calculate
+#   temp=float (default: 300.0): the tempurature in Kelvin
+#   freq_max=float (default: the maximum frequency in the SDs provided): The
+#     maximum frequncy in the SD for which to calculate chain parameters. Should
+#     be in Hartree
+#   freq_min=float (default: -1 * freq_max): The minimum frequency in the SD for
+#     which to calculate chain parameters
+#   output_file_name=str (default: chain_coeffs.hdf5): The name of the file to
+#     which the chain chain coefficients will be written. The file extension
+#     should probably be .hfd5
+#
+# Last updated 20240226 by Kye Hunter
+# Based on previous versions by Tim Zuehlsdorff (python),
+# Thibaut Lacroix (julia), Angus Dunnett (MatLab), and the ORTHPOL package by
+# Walter Gautschi, as well as other papers cited per function.
+
+import sys, h5py, math, warnings
+
+def dot(vec1 : list, vec2 : list):
+    '''Calculate the dot product of `vec1` and `vec2`.'''
+    return sum(v1 * v2 for v1, v2 in zip(vec1, vec2))
+
+def dot3(vec1 : list, vec2 : list, vec3 : list):
+    '''Integrate the product of 3 vectors.'''
+    return sum(v1 * v2 * v3 for v1, v2, v3 in zip(vec1, vec2, vec3))
+
+def coth_p1(z):
+    '''Calculate 1 + the hyperbolic cotangent of z.
+
+    Calculate
+        coth(z) + 1
+    accurate for large negative numbers (and others), and avoid errors for
+    z == 0, returning 0 instead.
+    '''
+    return math.exp(z) / math.sinh(z) if z != 0 else 0
+
+def read_dat(file_name):
+    '''Read a space delimited data file.'''
+    return list(zip(*[
+        list(map(float, line.strip().split()))
+        for line in open(file_name)
+        if len(line.strip()) > 0 and (
+            line.strip()[0].isnumeric() or line.strip()[0].startswith('-')
+        )
+    ]))
+
+def thermalize_sd(sd, freq_max = None, freq_min = None, temp = 300):
+    '''Thermalize a spectral density.
+
+    Takes a discrete spectral density defined for omega > 0 and calculates the
+    corresponding theramlized version following Tamascelli:
+    Phys. Rev. Lett. 123, 090402 (2019) p. 2 doi: 10.1103/PhysRevLett.123.090402
+    The positive-frequency spectral density is extended to negative frequencies
+    with the sign of the intensity flipped, and then it is multiplied by the
+    prefactor:
+        (1 + coth(omega / (2 * k_B * temp))) / 2
+    The range of the returned SD can be truncated to the interval between
+    `freq_min` and `freq_max`, but the default is to not truncate it, returning
+    an SD with twice the length of the input. The input SD should have the
+    frequencies in units of hartree. The return value is a 2x`n` list of lists
+    with the first column as the frequencies and second column as the
+    intensities.
+    '''
+    # Extend (and truncate) the spectral density
+    freq_max = freq_max if freq_max is not None else sd[0][-1]
+    freq_min = freq_min if freq_min is not None else -1.0 * freq_max
+    step = sd[0][1] - sd[0][0]
+    imin = int(abs(freq_min / step)) + 1 * (freq_max <= 0) + 1
+    imin = min(imin, len(sd[1]) - 1 * (sd[0][0] == 0))
+    imax = int(abs(freq_max / step)) + 1 * (freq_max >= 0)
+    imax = min(imax, len(sd[1]) - 1 * (sd[0][0] == 0))
+    frequencies = [
+        i * step for i in range(
+            int(math.copysign(imin, freq_min)),
+            int(math.copysign(imax, freq_max)) + 1
+        )
+    ]
+    if freq_min * freq_max > 0:
+        densities = [
+            math.copysign(val, freq_min) for val
+            in sd[1][imin:imax:int(math.copysign(1, freq_min))]
+        ]
+    elif sd[0][0] != 0:
+        densities = [-1 * val for val in sd[1][imin - 1::-1]] + [0.0] + list(
+            sd[1][0:imax]
+        )
+    else:
+        densities = [-1 * val for val in sd[1][imin:0:-1]] + list(
+            sd[1][0:imax + 1]
+        )
+
+    # Thermalize the spectral density
+    if temp != 0:
+        # k_B in Hartree
+        kbt2 = 3.1668115634555576e-06 * temp * 2
+        densities = [
+            dens * (coth_p1(freq / (kbt2))) / 2
+            for freq, dens in zip(frequencies, densities)
+        ]
+    else:
+        # At 0 K the prefeactor becomes the Heaviside step function
+        densities = [
+            dens if freq > 0 else 0
+            for freq, dens in zip(frequencies, densities)
+        ]
+
+    # Interpolate zero point in SD, but I think we shouldn't at 0 K
+    if 0 in frequencies and temp != 0:
+        zero = frequencies.index(0)
+        densities[zero] = (
+            densities[zero + 1]
+            + (densities[zero - 1] - densities[zero + 2]) / 3
+        )
+
+    return [frequencies, densities]
+
+def check_complex_values(vec, var):
+    '''Check a list of `float`s for `complex`s.
+
+    Propmts the user for what action to take if complex values are found:
+        r: Keep only the real part (discarding the imaginary part),
+        m: Keep only the magnitude (discarding the sign/phase),
+        i: Do nothing, returning the list as is, or
+        e: Exit.
+    '''
+    num_complex = sum(issubclass(type(val), complex) for val in vec)
+    if num_complex > 0:
+        warnings.warn(
+            f'Found {num_complex} complex values in {var}!',
+            RuntimeWarning,
+            stacklevel = 2
+        )
+        if var == 'norms':
+            print(
+                'This occurs when the cross SD becomes larger than sqrt(S1_sd *'
+                ' S2_sd), which should not be physically possible'
+            )
+        option = input(
+            'Do you want to take the real part, the magnitude, ignore them, or'
+            ' exit?\n[R,m,i,e]: '
+        )
+        if option.strip().lower().startswith('r') or len(option) == 0:
+            print(
+                f'Discaring the imaginary part of {num_complex} copmlex numbers'
+                f' in {var}'
+            )
+            vec = [val.real for val in vec]
+        elif option.strip().lower().startswith('m'):
+            print(
+                f'Replacing {num_complex} complex values with their magnitude'
+                f' in {var}'
+            )
+            vec = [
+                abs(val) if issubclass(type(val), complex) else val
+                for val in vec
+            ]
+        elif option.strip().lower().startswith('i'):
+            print(f'Ignoring {num_complex} complex values in {var}')
+        elif option.strip().lower().startswith('e'):
+            print(f'Exiting...')
+            raise SystemExit
+        else:
+            print(f'Could not understand "{option}", exiting...')
+            raise SystemExit
+    return vec
+
+def evals_to_jacobi(num_coeffs, evals, weights):
+    '''Reconstruct a Jacobi matrix from its spectrum of eigenvalues and weights.
+
+    Given a set of eigenvalues and weights (derived from the eigenvectors),
+    reconstruct a (non-unique) symmetric tridiagonal Jacobi matrix, returning
+    the principal leading submatrix of size `num_coeffs`. This function uses the
+    Rutishauser-Kahan-Pal-Walker algorithm:
+    Numer. Math. 44 (1984), 317-335. doi:10.1007/bf01405565 (page 328). Instead
+    of calculating the entire matrix, which has complexity O(num_evals^2), this
+    implementation truncates the inner loop such that only the requested number
+    of chain coefficents are calculated, giving complexity
+    O(num_evals * num_coeffs).
+
+    Equivalently, given the nodes and weights of discrete orthogonal
+    polynomials, this function will calculate the first `num_coeffs` recurrence
+    coefficients.
+
+    In terms of the Jacobi matrix:
+        _                        _
+        | a_1 b_1 0   .     0    |
+        | b_1 a_2 b_2 .     0    |
+        | 0   b_2 a_3 .     0    |
+        | .   .   .   .     b_n-1|
+        | 0   0   0   b_n-1 a_n  |
+        -                        -
+    The return value is a 2x`num_coeffs` list of lists with the first column as
+    the diagonal `a`s and the second column as the offdiagonal `b**2`s.
+    '''
+    # Remove nodes with 0 weight in the measure
+    nonzero_weights = [ival for ival, val in enumerate(weights) if val != 0]
+    evals = [evals[index] for index in nonzero_weights]
+    weights = [weights[index] for index in nonzero_weights]
+
+    num_evals = len(evals)
+    diag = evals[:num_coeffs].copy()
+    offdiag = [0] * num_coeffs
+    offdiag[0] = weights[0]
+    for n in range(1, num_evals):
+        lambda_ = evals[n]
+        pi = weights[n]
+        gamma = 1.0
+        sigma = 0.0
+        tau = 0.0
+        for k in range(min(n, num_coeffs)):
+            rho = offdiag[k] + pi
+            new_offdiag = gamma * rho
+            new_sigma = sigma
+            if rho <= 0: # It should never be less than 0
+                gamma = 1
+                sigma = 0
+            else:
+                gamma = offdiag[k] / rho
+                sigma = pi / rho
+            new_tau = sigma * (diag[k] - lambda_) - gamma * tau
+            diag[k] = diag[k] - new_tau + tau
+            tau = new_tau
+            if sigma <= 0: # It should never be less than 0
+                pi = new_sigma * offdiag[k]
+            else:
+                pi = tau ** 2 / sigma
+            sigma = new_sigma
+            offdiag[k] = new_offdiag
+    return [diag, offdiag]
+
+def long_range_coupling(nodes, weights, alphas, betas, coupled_weights):
+    '''Calculate the long range coupling from one chain to another.
+
+    Given a discrete measure and the recurrence coefficients for a set of
+    orthogonal polynomials on that measure, calculate the coupling of each
+    polynomial in the set with polynomials defined for a different discrete
+    measure.
+
+    Iteratively calculating orthogonal polynomials this way is prone to
+    numerical instability and over/underflow errors. The return value is a list
+    that is the same length as the recurrence coefficients input.
+    '''
+    # Remove nodes with 0 weight in the original and coupled measures
+    nonzero_weights = [
+        ival for ival, vals in enumerate(zip(weights, coupled_weights)) 
+        if vals[0] != 0 or vals[1] != 0
+    ]
+    nodes = [nodes[index] for index in nonzero_weights]
+    weights = [weights[index] for index in nonzero_weights]
+    coupled_weights = [coupled_weights[index] for index in nonzero_weights]
+
+    tiny = sys.float_info.min * 10
+    huge = sys.float_info.max / 10
+    num_coeffs = len(alphas)
+    num_nodes = len(nodes)
+    polynomial_0 = [0.0] * num_nodes
+    sigma = sum(weights)
+    sigma = sigma if sigma != 0 else 1
+    polynomial_1 = [1 / sigma] * num_nodes
+    coupling_coeffs = [
+        sum(coupled_weights) / (math.pi * sigma) ** 0.5
+    ] + [0.0] * (num_coeffs - 1)
+    overlaps = [0.0] * (num_nodes - 1)
+
+    for k in range(num_coeffs - 1):
+        # Calculate the next polynomial in the series using the recurrence
+        # coefficients
+        polynomial_2 = [
+            (node - alphas[k]) * p1 - betas[k] * p0
+            for node, p0, p1 in zip(nodes, polynomial_0, polynomial_1)
+        ]
+        overlaps[k] = abs(dot3(weights, polynomial_1, polynomial_2) / (
+            dot3(weights, polynomial_1, polynomial_1)
+            * dot3(weights, polynomial_2, polynomial_2) + tiny * 0.0001
+        ) ** 0.5)
+        sigmas = [w * p * p for w, p in zip(weights, polynomial_2)]
+
+        if max([abs(s) for s in sigmas] + [tiny]) > huge:
+            # This would not really be a problem, but it seems to never happen. 
+            # If it did, the polynomials could just be rescaled similar to what 
+            # is implimented for underflows.
+            raise RuntimeError(
+                'Impending overflow! sigmas is huge in long_range_coupling '
+                f'iteration {k}: max = {max([abs(s) for s in sigmas])}'
+            )
+        if min([abs(s) for s in sigmas if s != 0] + [huge]) < tiny:
+            rescale = max(
+                1 / max(abs(max(polynomial_2)), abs(min(polynomial_2))), 1e50
+            )
+            print(
+                'Impending underflow! sigmas is tiny in long_range_coupling '
+                f'iteration {k}: min = {min([abs(s) for s in sigmas])}.'
+                f' Rescaling polynomial_1 and polynomial_2 by {rescale}'
+            )
+            polynomial_1 = [val * rescale for val in polynomial_1]
+            polynomial_2 = [val * rescale for val in polynomial_2]
+            sigmas = [w * p * p for w, p in zip(weights, polynomial_2)]
+
+        coupling_coeffs[k + 1] = dot(
+            coupled_weights, polynomial_2
+        ) / (sum(sigmas) * math.pi + tiny * 1e-4) ** 0.5
+        polynomial_0 = polynomial_1
+        polynomial_1 = polynomial_2
+    return [coupling_coeffs, overlaps]
+
+def main(
+    s1_file, s2_file, cross_file, coupling_file, num_coeffs = 500, temp = 300,
+    freq_max = None, freq_min = None, output_file_name = 'chain_coeffs.hdf5'
+):
+    '''Map continuous spectral densities to chains of discrete nodes.
+
+    Thermalize, truncate, normalize, integrate, and map spectral densities to
+    chains. The method of calculating quadratures and long range couplings are
+    somewhat suspect still. The resulting chain parameters are written to an
+    HDF5 file.
+    '''
+    # Read in spectral densities
+    print(
+        f'Generating coefficients for 3 chains with {num_coeffs} nodes each.\n'
+        f'S1 spectral density: {s1_file}\n'
+        f'S2 spectral density: {s2_file}\n'
+        f'S1 cross S2 spectral density: {cross_file}\n'
+        f'S1-S2 coupling spectral density: {coupling_file}'
+        )
+    s1_sd = read_dat(s1_file)
+    s2_sd = read_dat(s2_file)
+    cross_sd = read_dat(cross_file)
+    coupling_sd = read_dat(coupling_file)
+    freq_max = freq_max if freq_max is not None else s1_sd[0][-1]
+    freq_min = freq_min if freq_min is not None else -1.0 * freq_max
+    # Thermalize the spectral densities
+    print(f'Thermalizing the spectral densities @ {temp} K.')
+    thermal_s1 = thermalize_sd(
+        s1_sd, freq_max = freq_max, freq_min = freq_min, temp = temp
+    )
+    thermal_s2 = thermalize_sd(
+        s2_sd, freq_max = freq_max, freq_min = freq_min, temp = temp
+    )
+    thermal_cross = thermalize_sd(
+        cross_sd, freq_max = freq_max, freq_min = freq_min, temp = temp
+    )
+    thermal_coupling = thermalize_sd(
+        coupling_sd, freq_max = freq_max, freq_min = freq_min, temp = temp
+    )
+    print(
+        f'Minimum frequency in discrete measure: {thermal_s1[0][0]} Ha\n'
+        f'Maximum frequency in discrete measure: {thermal_s1[0][-1]} Ha'
+    )
+    # Normalize the thermal spectral densities other than the coupling SD
+    # against each other
+    # These equations are part of the solution to the non-linear system of
+    # equations given in J. Chem. Phys. 155, 144112 (2021) eqns. S11 and S12
+    # (DOI 10.1063/5.0062950), though these solutions are simpler than the
+    # solutions provided there.
+    # In terms of the varibles in that paper, we can calculate G_1, G_2, and C
+    # from J_01, J_02, and J_cross by defining
+    #   `N = (1 + sqrt(1 - J~_cross ** 2)) / 2`
+    # with
+    #   `J~_cross = J_cross / sqrt(J_01 * J_02)`;
+    # then
+    #   `G_1 = J_01 * N`, `G_2 = J_02 * N`, and `C = 1 / N - 1`.
+    # Addiationally we can calculate the square root of C with the correct sign:
+    #   `sqrt(C) = (2 - 2 * N) / J~_cross`.
+    # The factor N has an interesting geometric interpretation which helps to
+    # explain why G_1, G_2, and C can all be trivially calculated from it: By
+    # writing N in terms of trig functions we find
+    #   `N = cos(asin(J~_cross) / 2) ** 2`.
+    # And so by constructing a right triangle with J_cross as a leg and
+    # sqrt(J_01 * J_02) as the hypotenuse, we find the correct normalization
+    # factor by bisecting one of the angles and taking the ratio of the other
+    # leg and the new hypotenuse. (The trig functions are less efficient to
+    # calculate however.) In the end we don't actually need to calculate C.
+    norms = [
+        (1 + (1 - c ** 2 / (s1 * s2)) ** 0.5) / 2 if s1 * s2 != 0 else 1.0
+        for s1, s2, c in zip(thermal_s1[1], thermal_s2[1], thermal_cross[1])
+    ]
+    norms = check_complex_values(norms, 'norms')
+    norm_s1 = [thermal_s1[0], [s1 * n for s1, n in zip(thermal_s1[1], norms)]]
+    norm_s2 = [thermal_s2[0], [s2 * n for s2, n in zip(thermal_s2[1], norms)]]
+    norm_cross = [thermal_cross[0], [c / 2 for c in thermal_cross[1]]]
+
+    # Do a "quadrature", this "algorithm" could be a source of numerical error
+    step = norm_s1[0][1] - norm_s1[0][0]
+    norm_s1[1] = [val * step for val in norm_s1[1]]
+    norm_s2[1] = [val * step for val in norm_s2[1]]
+    norm_cross[1] = [val * step for val in norm_cross[1]]
+    norm_coupling = [
+        thermal_coupling[0], [val * step for val in thermal_coupling[1]]
+    ]
+
+    # S1 chain coefficients; alphas are energies and betas are hopping params
+    s1_alphas, s1_betas_squared = evals_to_jacobi(num_coeffs, *norm_s1)
+
+    s1_betas = [val ** 0.5 for val in s1_betas_squared[1:]] + [
+        (sum(norm_s1[1]) / math.pi) ** 0.5
+    ]
+    # S1 -> S2 long range coupling
+    s1_long_range, s1_overlaps = long_range_coupling(
+        *norm_s1, s1_alphas, s1_betas_squared, norm_cross[1]
+    )
+    print(
+        f'Maximum overlap between adjacent S1 polynomials: {max(s1_overlaps)}'
+    )
+    # S2 chain coefficients
+    s2_alphas, s2_betas_squared = evals_to_jacobi(num_coeffs, *norm_s2)
+    s2_betas = [val ** 0.5 for val in s2_betas_squared[1:]] + [
+        (sum(norm_s2[1]) / math.pi) ** 0.5
+    ]
+    # S2 -> S1 long range coupling
+    s2_long_range, s2_overlaps = long_range_coupling(
+        *norm_s2, s2_alphas, s2_betas_squared, norm_cross[1]
+    )
+    print(
+        f'Maximum overlap between adjacent S2 polynomials: {max(s2_overlaps)}'
+    )
+
+    # S1-S2 coupling chain coeffiecients
+    coupling_alphas, coupling_betas_squared = evals_to_jacobi(
+        num_coeffs, *norm_coupling
+    )
+    coupling_betas = [val ** 0.5 for val in coupling_betas_squared[1:]] + [
+        (sum(norm_coupling[1]) / math.pi) ** 0.5
+    ]
+    # Write output
+    print(f'Writing output to {output_file_name}')
+    # create new hdf5 file in 'write mode'
+    output_handle = h5py.File(output_file_name, 'w')  
+    root_group = output_handle.create_group(f'temp_{temp}')
+    root_group.create_dataset('long_range_s1_to_s2', data = s1_long_range)
+    root_group.create_dataset('long_range_s2_to_s1', data = s2_long_range)
+    s1_group = root_group.create_group('s1')
+    s1_group.create_dataset('e', data = s1_alphas)
+    s1_group.create_dataset('t', data = s1_betas[:-1])
+    s1_group.create_dataset('c', data = s1_betas[-1])
+    s2_group = root_group.create_group('s2')
+    s2_group.create_dataset('e', data = s2_alphas)
+    s2_group.create_dataset('t', data = s2_betas[:-1])
+    s2_group.create_dataset('c', data = s2_betas[-1])
+    coupling_group = root_group.create_group('s1_s2_coupling')
+    coupling_group.create_dataset('e', data = coupling_alphas)
+    coupling_group.create_dataset('t', data = coupling_betas[:-1])
+    coupling_group.create_dataset('c', data = coupling_betas[-1])
+    output_handle.close()
+
+    print('All done!')
+    return [
+        s1_alphas, s1_betas, s1_long_range,
+        s2_alphas, s2_betas, s2_long_range,
+        coupling_alphas, coupling_betas
+    ]
+
+# Run `main` immediately if called as a script, but don't when loaded as a
+# module
+if __name__ == "__main__":
+    args = sys.argv[1:5]
+    keyword_args = {
+        word.split('=')[0] : (
+            int if word.split('=')[0] == 'num_coeffs'
+            else str if word.split('=')[0] == 'output_file_name'
+            else float
+        )(word.split('=')[1]) for word in sys.argv[5:]
+    }
+    result = main(*args, **keyword_args)
+
+def quaddat(SD):
+    '''Return a two column function with weights and nodes from a discrete
+    sampling of a continuous spectral density.
+    '''
+    DM = np.zeros((SD.shape[0] - 1, 2)) 
+    # This is just trapezoidal integration
+    for i in range(DM.shape[0]):
+        DM[i, 0] = (SD[i + 1, 0] + SD[i, 0]) / 2.0
+        DM[i, 1] = (SD[i + 1, 1] + SD[i, 1]) * (SD[i + 1, 0] - SD[i, 0]) / 2.0
+    return DM
+
+def stieltjes_recurrence_coefficients(num_coeffs, nodes, weights):
+    '''Apply the discretized Stieltjes procedure to a set of nodes and weights.
+
+    From a set of nodes and weights defining a discrete measure on some
+    interval, calculate the first `N` alpha and beta recurrence coefficients of
+    the associated orthogonal polynomials. The return value is a 2x`N` list of
+    lists with the first column as the alpha coefficients and the second column
+    as the beta coefficitents.
+
+    The algorithm is prone to over- and underflow errors when a large number of
+    recurrence coefficients are requested.
+
+    See J. Comput. Appl. Math 12-13 (1985) 61-76, especially section 5 equations
+    5.2 and 5.3 pp. 68-9 for more details: doi 10.1016/0377-0427(85)90007-x.
+    '''
+    tiny = sys.float_info.min * 10
+    huge = sys.float_info.max * 1e-150
+    alphas = [0] * num_coeffs
+    betas = [0] * num_coeffs
+    while 0 in weights:
+        izero = weights.index(0)
+        nodes.__delitem__(izero)
+        weights.__delitem__(izero)
+
+    num_nodes = len(nodes)
+    sigma0 = sum(weights)
+    alphas[0] = dot(nodes, weights) / sigma0
+    betas[0] = sigma0
+    pi0 = [0.0] * num_nodes
+    pi1 = [1 / sigma0] * num_nodes
+    for k in range(num_coeffs - 1):
+        pi2 = [
+            (node - alphas[k]) * p1 - betas[k] * p0
+            for node, p0, p1 in zip(nodes, pi0, pi1)
+        ]
+        sigma1 = dot3(weights, pi2, pi2)
+        sigma2 = dot3(nodes, weights, [p ** 2 for p in pi2])
+
+        if max([abs(p) for p in pi2]) > huge ** 0.5:
+            rescale = 1 / max(abs(max(pi2)), abs(min(pi2)))
+            print(
+                'Impending overflow! pi2 was huge in stieltjes '
+                f'iteration {k}: sigma2 = {sigma2}. Rescaling pi1 and '
+                f'pi2 by {rescale}'
+            )
+            pi1 = [val * rescale for val in pi1]
+            pi2 = [val * rescale for val in pi2]
+            sigma1 = dot3(weights, pi2, pi2)
+            sigma2 = dot3(nodes, weights, [p ** 2 for p in pi2])
+        if abs(sigma2) > huge:
+            rescale = 1 / max(abs(max(pi2)), abs(min(pi2)))
+            print(
+                'Impending overflow! sigma2 was huge in stieltjes '
+                f'iteration {k}: sigma2 = {sigma2}. Rescaling pi1 and '
+                f'pi2 by {rescale}'
+            )
+            pi1 = [val * rescale for val in pi1]
+            pi2 = [val * rescale for val in pi2]
+            sigma1 = dot3(weights, pi2, pi2)
+            sigma2 = dot3(nodes, weights, [p ** 2 for p in pi2])
+        if abs(sigma1) < tiny:
+            rescale = 1 / max(abs(max(pi2)), abs(min(pi2)))
+            print(
+                'Impending underflow! sigma1 was tiny in stieltjes '
+                f'iteration {k}: sigma1 = {sigma1}. Rescaling pi1 and '
+                f'pi2 by {rescale}'
+            )
+            pi1 = [val * rescale for val in pi1]
+            pi2 = [val * rescale for val in pi2]
+            sigma1 = dot3(weights, pi2, pi2)
+            sigma2 = dot3(nodes, weights, [p ** 2 for p in pi2])
+
+        alphas[k + 1] = sigma2 / sigma1
+        betas[k + 1] = sigma1 / sigma0
+        sigma0 = sigma1
+        pi0 = pi1
+        pi1 = pi2
+    return [alphas, betas]
+
+def jacobi_recurrence_coefficients(N : int, a = 0, b = None):
+    '''Calculate recurrence coefficients for monic Jacobi polynomials.
+
+    Generates the first N recurrence coefficients for monic Jacobi polynomials
+    `P^(a,b)_(1 -> N)`. These are orthogonal on [-1,1] relative to the weight
+    function
+        `w(x) = (1 - x) ** a * (1 + x) ** b`.
+    The return value is a 2x`N` list of lists with the first column as the alpha
+    coefficients, and second column as the beta coefficients.
+    '''
+    b = b if b is not None else a
+    alphas = [(b - a) / (a + b + 2.0)] + [
+        (b ** 2 - a ** 2) / (n * (n + 2))
+        for n in range(2 + a + b, 2 * N + a + b - 1, 2)
+    ]
+    betas = [
+        2.0 ** (a + b + 1.0) * special.gamma(a + 1.0) * special.gamma(b + 1.0)
+        / special.gamma(a + b + 2.0)
+    ] + [
+        4 * (a + 1) * (b + 1) / ((a + b + 2) ** 2 * (a + b + 3))
+    ] + [
+        4 * (m + a) * (m + b) * m * (m + a + b) / (n ** 2 * (n + 1) * (n - 1))
+        for m, n in zip(range(2, N), range(4 + a + b, 2 * N + a + b - 1, 2))
+    ]
+    return [alphas[:N], betas[:N]]
+
+
+def gauss_quadrature(N, alphas, betas):
+    '''Apply an `N`-point Gauss quadrature rule.
+
+    Given a weight function encoded by the first M alpha and beta recurrence
+    coefficients of the associated orthogonal polynomials, the function
+    generates the nodes and weights of the N-point Gauss quadrature rule of the
+    weight function. The return value is a 2x`N` list of lists with the first
+    column as the nodes, in increasing order, and second column as the
+    corresponding weights.
+
+    The recurrence coefficients are formed into a Jacobi matrix:
+        _                     _
+        | a_1 b_2 0   .   0   |
+        | b_2 a_2 b_3 .   0   |
+        | 0   b_3 a_3 .   0   |
+        | .   .   .   .   b_n |
+        | 0   0   0   b_n a_n |
+        -                     -
+    whose eigenvalues are returned with the first values of the eigenvectors
+    squared and scaled by `b_1`.
+
+    Citations from the Fortran source:
+    Numer. Math. 12, 1968, 377-383
+    Numer. Math. 15, 1970, 450
+    Handbook for Autom. Comput., vol. 2 - Linear Algebra, pp.241-248
+    '''
+    betas2 = np.sqrt(betas[1:N])
+    jacobi_mat = np.diag(alphas[:N]) + np.diag(betas2, 1) + np.diag(betas2,-1)
+    evals, evecs = np.linalg.eigh(jacobi_mat)
+    return [evals, evecs[0,:] ** 2 * betas[0, 1]]
+
+
